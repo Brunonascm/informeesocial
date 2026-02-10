@@ -7,14 +7,14 @@ from fpdf import FPDF
 import datetime
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Gerador Blindado de Informes", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Gerador Pro de Informes", page_icon="💼", layout="wide")
 
-st.title("🛡️ Gerador de Informes (Auditoria Completa S-1200 e S-1210)")
+st.title("💼 Gerador de Informes de Rendimentos (eSocial)")
 st.markdown("""
-**Segurança Total:**
-1. Valida se existem **buracos no S-1200** (ex: faltou importar Fevereiro).
-2. Valida se existem **buracos no S-1210** (ex: calculou mas não pagou).
-3. Permite correção manual e geração segura.
+**Instruções:**
+1. Arraste os arquivos ZIP (Inclua S-2200 e S-2299 para validar Admissão/Demissão).
+2. Defina o **Ano-Calendário**.
+3. Verifique a **Auditoria Inteligente**.
 """)
 
 # --- CLASSE PDF (LAYOUT RECEITA FEDERAL) ---
@@ -141,7 +141,9 @@ def strip_namespace(xml_content):
 def processar_arquivos(uploaded_files):
     s1200_data = []
     s1210_data = []
-    mapa_nomes = {} 
+    mapa_nomes = {}
+    mapa_admissao = {} # Guarda data de admissão
+    mapa_demissao = {} # Guarda data de desligamento
     
     progress = st.progress(0)
     for i, file in enumerate(uploaded_files):
@@ -153,11 +155,26 @@ def processar_arquivos(uploaded_files):
                     root = strip_namespace(content)
                     if root is None: continue
                     
-                    if root.find('.//trabalhador'):
+                    # ADMISSÃO (S-2200) - CAPTURA DATA
+                    if root.find('.//trabalhador') and not root.find('.//desligamento'):
                         try:
-                            mapa_nomes[root.find('.//cpfTrab').text] = root.find('.//nmTrab').text
+                            cpf = root.find('.//cpfTrab').text
+                            mapa_nomes[cpf] = root.find('.//nmTrab').text
+                            dt_adm = root.find('.//dtAdm').text 
+                            mapa_admissao[cpf] = dt_adm
+                        except: pass
+
+                    # DESLIGAMENTO (S-2299) - CAPTURA DATA
+                    elif root.find('.//desligamento'):
+                        try:
+                            cpf = root.find('.//cpfTrab').text
+                            if root.find('.//nmTrab'):
+                                mapa_nomes[cpf] = root.find('.//nmTrab').text
+                            dt_deslig = root.find('.//dtDeslig').text
+                            mapa_demissao[cpf] = dt_deslig
                         except: pass
                     
+                    # S-1200
                     elif root.find('.//evtRemun'): 
                         try:
                             cpf = root.find('.//cpfTrab').text
@@ -174,6 +191,7 @@ def processar_arquivos(uploaded_files):
                                     })
                         except: pass
                     
+                    # S-1210
                     elif root.find('.//evtPgtos'): 
                         try:
                             ide_benef = root.find('.//ideBenef')
@@ -190,35 +208,36 @@ def processar_arquivos(uploaded_files):
                         except: pass
         progress.progress((i + 1) / len(uploaded_files))
     
-    return pd.DataFrame(s1200_data), pd.DataFrame(s1210_data), mapa_nomes
+    return pd.DataFrame(s1200_data), pd.DataFrame(s1210_data), mapa_nomes, mapa_admissao, mapa_demissao
 
 # --- INTERFACE ---
 uploaded_zips = st.file_uploader("📂 Faça upload dos ZIPs do eSocial", type="zip", accept_multiple_files=True)
-
-# SELETOR DE ANO
 ano_selecionado = st.number_input("📅 Ano-Calendário", min_value=2020, max_value=2030, value=2025, step=1)
 
 if uploaded_zips:
     if 'df_1200' not in st.session_state:
         st.info("Processando arquivos...")
-        st.session_state.df_1200, st.session_state.df_1210, st.session_state.mapa_nomes = processar_arquivos(uploaded_zips)
+        st.session_state.df_1200, st.session_state.df_1210, st.session_state.mapa_nomes, st.session_state.mapa_admissao, st.session_state.mapa_demissao = processar_arquivos(uploaded_zips)
     
     df_1200 = st.session_state.df_1200
     df_1210 = st.session_state.df_1210
     mapa_nomes = st.session_state.mapa_nomes
+    mapa_admissao = st.session_state.mapa_admissao
+    mapa_demissao = st.session_state.mapa_demissao
     
-    if not df_1200.empty:
-        # --- LÓGICA DE AUDITORIA DUPLA ---
+    if not df_1200.empty or not df_1210.empty:
+        # --- AUDITORIA INTELIGENTE ---
         st.divider()
         st.subheader("🕵️ Auditoria de Integridade")
         
-        cpfs = sorted(df_1200['CPF'].unique())
-        
-        # Preparar lista de competências esperadas para o ano
-        meses_esperados = [f"{ano_selecionado}-{str(m).zfill(2)}" for m in range(1, 13)]
+        # Recupera CPFs de TODOS os arquivos
+        cpfs_1200 = set(df_1200['CPF'].unique()) if not df_1200.empty else set()
+        cpfs_1210 = set(df_1210['CPF'].unique()) if not df_1210.empty else set()
+        todos_cpfs = sorted(list(cpfs_1200.union(cpfs_1210)))
         
         pendencias_pagamento = [] # Tem S-1200 mas não tem S-1210
-        alertas_ausencia = []    # Não tem S-1200 (buraco no ano)
+        alertas_sem_rubrica = []  # Tem S-1210 mas NÃO TEM S-1200 (CRÍTICO)
+        alertas_meses_faltantes = [] # Tem S-1200 mas faltam meses (AMARELO)
 
         pagamentos_reais = set()
         if not df_1210.empty:
@@ -226,52 +245,85 @@ if uploaded_zips:
             for _, row in df_checks.iterrows():
                 pagamentos_reais.add((row['CPF'], row['Competencia_Paga']))
         
-        for cpf in cpfs:
+        for cpf in todos_cpfs:
             nome = mapa_nomes.get(cpf, f"CPF {cpf}")
+            
+            # 1. Checa se tem S-1200 (Cálculo) - CRÍTICO
+            if cpf not in cpfs_1200:
+                alertas_sem_rubrica.append({
+                    "CPF": cpf, "Nome": nome,
+                    "Obs": "Nenhum S-1200 encontrado. Impossível calcular Bruto/INSS."
+                })
+                continue 
+
+            # 2. Checa meses faltantes no S-1200 (INTELIGENTE)
             comps_encontradas = set(df_1200[df_1200['CPF'] == cpf]['Competencia'].unique())
             
-            # 1. Auditoria de S-1200 (Buracos no ano)
-            # Verifica se tem menos de 12 meses (sem contar 13o)
-            meses_presentes = [m for m in comps_encontradas if len(m) == 7] # Ignora anuais '2025'
-            if len(meses_presentes) < 12:
-                faltantes = [m for m in meses_esperados if m not in comps_encontradas]
-                # Se faltar muitos, pode ser admissão. Se faltar um no meio, é erro.
-                alertas_ausencia.append({
-                    "CPF": cpf, "Nome": nome, 
-                    "Meses Encontrados": len(meses_presentes),
-                    "Obs": "Possível Admissão/Demissão ou Arquivo Faltante"
+            # Lógica de Datas
+            mes_inicio, mes_fim = 1, 12
+            obs_periodo = "Ano Completo"
+            
+            if cpf in mapa_admissao:
+                dt_adm = datetime.datetime.strptime(mapa_admissao[cpf], "%Y-%m-%d")
+                if dt_adm.year == ano_selecionado:
+                    mes_inicio = dt_adm.month
+                    obs_periodo = f"Admissão em {dt_adm.strftime('%d/%m')}"
+            
+            if cpf in mapa_demissao:
+                dt_dem = datetime.datetime.strptime(mapa_demissao[cpf], "%Y-%m-%d")
+                if dt_dem.year == ano_selecionado:
+                    mes_fim = dt_dem.month
+                    obs_periodo = f"Desligamento em {dt_dem.strftime('%d/%m')}"
+
+            # Verifica buracos no período ativo
+            meses_esperados = [f"{ano_selecionado}-{str(m).zfill(2)}" for m in range(mes_inicio, mes_fim + 1)]
+            faltantes = [m for m in meses_esperados if m not in comps_encontradas]
+            
+            if faltantes:
+                alertas_meses_faltantes.append({
+                    "CPF": cpf, "Nome": nome,
+                    "Meses Faltantes": ", ".join(faltantes),
+                    "Motivo Calculado": obs_periodo # Transparência para o usuário
                 })
 
-            # 2. Auditoria de S-1210 (Tem cálculo mas não tem pagamento)
+            # 3. Checa S-1210 faltante
             for comp in comps_encontradas:
                 if (cpf, comp) not in pagamentos_reais:
                     pendencias_pagamento.append({
                         "CPF": cpf, "Nome": nome,
                         "Competencia Faltante": comp, "Data Pagamento (DD/MM/AAAA)": "", "IRRF Manual (R$)": 0.0
                     })
-        
-        # EXIBIÇÃO DOS RESULTADOS DA AUDITORIA
-        col_aud1, col_aud2 = st.columns(2)
-        
-        with col_aud1:
-            if alertas_ausencia:
-                st.warning(f"⚠️ **Alerta S-1200:** {len(alertas_ausencia)} funcionários têm menos de 12 meses calculados.")
-                with st.expander("Ver lista de possíveis faltas de arquivo S-1200"):
-                    st.dataframe(pd.DataFrame(alertas_ausencia), width='stretch')
-            else:
-                st.success("✅ Todos os funcionários têm 12 meses de S-1200.")
 
-        with col_aud2:
+        # EXIBIÇÃO RESULTADOS
+        c1, c2, c3 = st.columns(3)
+        
+        with c1:
+            if alertas_sem_rubrica:
+                st.error(f"❌ **Crítico (Sem S-1200):** {len(alertas_sem_rubrica)} CPFs.")
+                with st.expander("Ver Detalhes"):
+                    st.dataframe(pd.DataFrame(alertas_sem_rubrica), width='stretch')
+            else:
+                st.success("✅ Todos têm S-1200.")
+
+        with c2:
+            if alertas_meses_faltantes:
+                st.warning(f"⚠️ **Aviso S-1200:** {len(alertas_meses_faltantes)} CPFs com meses faltantes.")
+                with st.expander("Verificar se é erro ou admissão não lida"):
+                    st.dataframe(pd.DataFrame(alertas_meses_faltantes), width='stretch')
+            else:
+                st.success("✅ Sequência de meses correta.")
+
+        with c3:
             if pendencias_pagamento:
-                st.error(f"❌ **Erro S-1210:** {len(pendencias_pagamento)} competências calculadas sem pagamento.")
+                st.warning(f"⚠️ **Atenção S-1210:** {len(pendencias_pagamento)} cálculos sem pagamento.")
             else:
-                st.success("✅ Todos os cálculos têm pagamento (S-1210) correspondente.")
+                st.success("✅ Pagamentos conciliados.")
 
-        # --- PAINEL DE CORREÇÃO (S-1210) ---
+        # --- PAINEL CORREÇÃO ---
         df_manuais = pd.DataFrame()
         if pendencias_pagamento:
             with st.expander("📝 Corrigir Pagamentos Faltantes (S-1210)", expanded=True):
-                st.info("Preencha a data de pagamento para os itens abaixo:")
+                st.info("Preencha a data para validar os meses abaixo:")
                 df_pendencias = pd.DataFrame(pendencias_pagamento)
                 editor_pendencias = st.data_editor(
                     df_pendencias,
@@ -286,23 +338,26 @@ if uploaded_zips:
                 )
                 df_manuais = editor_pendencias[editor_pendencias["Data Pagamento (DD/MM/AAAA)"] != ""]
 
-        # --- PAINEIS AUXILIARES ---
+        # --- AUXILIARES ---
         with st.expander("👥 Conferência de Nomes"):
-            df_nomes = pd.DataFrame(cpfs, columns=['CPF'])
+            df_nomes = pd.DataFrame(todos_cpfs, columns=['CPF'])
             df_nomes['Nome'] = df_nomes['CPF'].apply(lambda x: mapa_nomes.get(x, f"FUNCIONÁRIO CPF {x}"))
             df_nomes_editado = st.data_editor(df_nomes, hide_index=True, width='stretch')
             mapa_nomes_final = dict(zip(df_nomes_editado['CPF'], df_nomes_editado['Nome']))
 
         with st.expander("📊 Totais por Rubrica (De/Para)"):
-            resumo_rubricas = df_1200.groupby('Rubrica').agg(Total=('Valor', 'sum'), Qtd=('Rubrica', 'count')).reset_index().sort_values('Total', ascending=False)
-            resumo_rubricas['Total'] = resumo_rubricas['Total'].apply(lambda x: f"R$ {x:,.2f}")
-            st.dataframe(resumo_rubricas, width='stretch')
+            if not df_1200.empty:
+                resumo_rubricas = df_1200.groupby('Rubrica').agg(Total=('Valor', 'sum'), Qtd=('Rubrica', 'count')).reset_index().sort_values('Total', ascending=False)
+                resumo_rubricas['Total'] = resumo_rubricas['Total'].apply(lambda x: f"R$ {x:,.2f}")
+                st.dataframe(resumo_rubricas, width='stretch')
+            else:
+                st.warning("Sem dados de S-1200 para mostrar rubricas.")
 
         # --- CONFIGURAÇÃO ---
         st.divider()
         st.subheader("Configuração Final")
         
-        rubricas_unicas = sorted(df_1200['Rubrica'].unique())
+        rubricas_unicas = sorted(df_1200['Rubrica'].unique()) if not df_1200.empty else []
         c1, c2 = st.columns(2)
         with c1:
             r_bruto = st.multiselect("Salário/Férias (Bruto)", rubricas_unicas)
@@ -317,20 +372,20 @@ if uploaded_zips:
         nome_emp = col_emp1.text_input("Nome da Empresa", "SUA EMPRESA LTDA")
         cnpj_emp = col_emp2.text_input("CNPJ", "00.000.000/0001-00")
 
-        # --- ENGINE DE CÁLCULO ---
+        # --- CALCULO ---
         def calcular_todos_funcionarios():
             resultados = []
-            for cpf in cpfs:
+            for cpf in todos_cpfs:
+                if cpf not in cpfs_1200: continue
+
                 itens = df_1200[df_1200['CPF'] == cpf].to_dict('records')
-                saude = df_1210[(df_1210['CPF'] == cpf) & (df_1210['Tipo'] == 'Saude')].to_dict('records')
+                saude = df_1210[(df_1210['CPF'] == cpf) & (df_1210['Tipo'] == 'Saude')].to_dict('records') if not df_1210.empty else []
                 
-                # S-1210 XML
                 comps_pagas_xml = set()
                 if not df_1210.empty:
                     mask = (df_1210['CPF'] == cpf) & (df_1210['Tipo'] == 'Pagamento_Check')
                     comps_pagas_xml = set(df_1210[mask]['Competencia_Paga'].unique())
                 
-                # S-1210 Manual
                 comps_pagas_manual = set()
                 irrf_manual_total = 0.0
                 if not df_manuais.empty:
@@ -340,9 +395,7 @@ if uploaded_zips:
                 
                 todas_comps_pagas = comps_pagas_xml.union(comps_pagas_manual)
                 
-                # Filtra itens válidos (Pagos no ano ou competência manual)
-                # OBS: Aqui assumimos que se a rubrica é anual (len 4), ela entra. 
-                # Se for mensal, tem que estar na lista de pagas.
+                # Assume que rubricas anuais (13o) entram se houver pagamento anual ou se for Dezembro
                 itens_validos = [i for i in itens if i['Competencia'] in todas_comps_pagas or len(i['Competencia']) == 4]
                 
                 def somar(rubricas): return sum(i['Valor'] for i in itens_validos if i['Rubrica'] in rubricas)
@@ -361,17 +414,14 @@ if uploaded_zips:
                     key = (s['CNPJ'], s['ANS'])
                     if key not in saude_dict: saude_dict[key] = 0.0
                     saude_dict[key] += s['Valor']
-                
                 if saude_dict:
                     txt_saude += "DESPESAS MÉDICAS/ODONTOLÓGICAS:\n"
                     for (cnpj, ans), valor in saude_dict.items():
                         txt_saude += f"OPERADORA CNPJ: {cnpj} (Reg. ANS: {ans}) - VALOR ANUAL: R$ {fmt(valor)}\n"
-                
                 if not txt_saude: txt_saude = "Sem informações complementares."
 
                 resultados.append({
-                    'cpf': cpf,
-                    'nome': mapa_nomes_final.get(cpf, f"CPF {cpf}"),
+                    'cpf': cpf, 'nome': mapa_nomes_final.get(cpf, f"CPF {cpf}"),
                     'calculados': {
                         'v_bruto': v_bruto, 'v_inss': v_inss, 'v_irrf': v_irrf,
                         'v_13_bruto': v_13_bruto, 'v_13_inss': v_13_inss, 'v_13_irrf': v_13_irrf,
@@ -427,4 +477,4 @@ if uploaded_zips:
                     st.success("Relatório Gerado!")
                     st.download_button("📥 Baixar Excel", output.getvalue(), "Relatorio_Conferencia.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.warning("Nenhum dado S-1200 encontrado.")
+        st.warning("Nenhum arquivo XML encontrado.")
