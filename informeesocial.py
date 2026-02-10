@@ -7,18 +7,17 @@ from fpdf import FPDF
 import datetime
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Gerador Pro de Informes", page_icon="💼", layout="wide")
+st.set_page_config(page_title="Gerador Blindado de Informes", page_icon="🛡️", layout="wide")
 
-st.title("💼 Gerador de Informes de Rendimentos (eSocial)")
+st.title("🛡️ Gerador de Informes (Auditoria Completa S-1200 e S-1210)")
 st.markdown("""
-**Instruções:**
-1. Arraste os arquivos ZIP.
-2. Defina o **Ano-Calendário** abaixo.
-3. Corrija pendências e mapeie as rubricas.
-4. Escolha: **Gerar PDF Oficial** ou **Exportar Relatório Excel**.
+**Segurança Total:**
+1. Valida se existem **buracos no S-1200** (ex: faltou importar Fevereiro).
+2. Valida se existem **buracos no S-1210** (ex: calculou mas não pagou).
+3. Permite correção manual e geração segura.
 """)
 
-# --- CLASSE PDF (LAYOUT RECEITA FEDERAL - BOX) ---
+# --- CLASSE PDF (LAYOUT RECEITA FEDERAL) ---
 class PDFLayoutReceita(FPDF):
     def __init__(self, ano_calendario):
         super().__init__()
@@ -37,7 +36,6 @@ class PDFLayoutReceita(FPDF):
         self.cell(0, 5, 'IMPOSTO SOBRE A RENDA RETIDO NA FONTE', 0, 1, 'C')
         self.ln(2)
         self.set_font('Arial', 'B', 9)
-        # USA O ANO SELECIONADO PELO USUÁRIO
         self.cell(0, 5, f'ANO-CALENDÁRIO: {self.ano_calendario}   |   EXERCÍCIO: {self.exercicio}', 0, 1, 'R')
         self.ln(4)
         self.set_font('Arial', '', 6)
@@ -75,10 +73,10 @@ def fmt(valor):
     return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def gerar_pdf_final(dados_calculados, dados_cadastrais, ano_base):
-    pdf = PDFLayoutReceita(ano_base) # Passa o ano para a classe
+    pdf = PDFLayoutReceita(ano_base)
     pdf.add_page()
     
-    # 1. Fonte Pagadora
+    # 1. Fonte
     pdf.titulo_secao("1", "FONTE PAGADORA PESSOA JURÍDICA OU PESSOA FÍSICA")
     pdf.campo_box("CNPJ/CPF", dados_cadastrais['Empregador_CNPJ'], w=50) 
     pdf.campo_box("Nome Empresarial / Nome Completo", dados_cadastrais['Empregador_Nome'], w=140, ln=1)
@@ -121,7 +119,6 @@ def gerar_pdf_final(dados_calculados, dados_cadastrais, ano_base):
     # 8. Responsável
     pdf.titulo_secao("8", "RESPONSÁVEL PELAS INFORMAÇÕES")
     pdf.campo_box("Nome", dados_cadastrais['Empregador_Nome'], w=110)
-    # Data dinâmica com o ano do exercício
     data_assinatura = datetime.date.today().strftime('%d/%m/') + str(int(ano_base)+1)
     pdf.campo_box("Data", data_assinatura, w=30)
     pdf.campo_box("Assinatura", "", w=50, ln=1)
@@ -198,9 +195,8 @@ def processar_arquivos(uploaded_files):
 # --- INTERFACE ---
 uploaded_zips = st.file_uploader("📂 Faça upload dos ZIPs do eSocial", type="zip", accept_multiple_files=True)
 
-# SELETOR DE ANO (NOVO!)
-ano_selecionado = st.number_input("📅 Ano-Calendário (Ano Base)", min_value=2020, max_value=2030, value=2025, step=1)
-st.caption(f"Exercício será: {ano_selecionado + 1}")
+# SELETOR DE ANO
+ano_selecionado = st.number_input("📅 Ano-Calendário", min_value=2020, max_value=2030, value=2025, step=1)
 
 if uploaded_zips:
     if 'df_1200' not in st.session_state:
@@ -212,9 +208,18 @@ if uploaded_zips:
     mapa_nomes = st.session_state.mapa_nomes
     
     if not df_1200.empty:
-        # --- AUDITORIA ---
+        # --- LÓGICA DE AUDITORIA DUPLA ---
+        st.divider()
+        st.subheader("🕵️ Auditoria de Integridade")
+        
         cpfs = sorted(df_1200['CPF'].unique())
-        pendencias_lista = []
+        
+        # Preparar lista de competências esperadas para o ano
+        meses_esperados = [f"{ano_selecionado}-{str(m).zfill(2)}" for m in range(1, 13)]
+        
+        pendencias_pagamento = [] # Tem S-1200 mas não tem S-1210
+        alertas_ausencia = []    # Não tem S-1200 (buraco no ano)
+
         pagamentos_reais = set()
         if not df_1210.empty:
             df_checks = df_1210[df_1210['Tipo'] == 'Pagamento_Check']
@@ -222,24 +227,52 @@ if uploaded_zips:
                 pagamentos_reais.add((row['CPF'], row['Competencia_Paga']))
         
         for cpf in cpfs:
-            comps_calc = df_1200[df_1200['CPF'] == cpf]['Competencia'].unique()
-            for comp in comps_calc:
-                # Se não achou pagamento E não é do ano seguinte (evita erro com Dezembro pago em Janeiro)
-                # Na verdade, a regra simples é: Se tem S-1200, precisa ter S-1210 no ano calendário selecionado.
+            nome = mapa_nomes.get(cpf, f"CPF {cpf}")
+            comps_encontradas = set(df_1200[df_1200['CPF'] == cpf]['Competencia'].unique())
+            
+            # 1. Auditoria de S-1200 (Buracos no ano)
+            # Verifica se tem menos de 12 meses (sem contar 13o)
+            meses_presentes = [m for m in comps_encontradas if len(m) == 7] # Ignora anuais '2025'
+            if len(meses_presentes) < 12:
+                faltantes = [m for m in meses_esperados if m not in comps_encontradas]
+                # Se faltar muitos, pode ser admissão. Se faltar um no meio, é erro.
+                alertas_ausencia.append({
+                    "CPF": cpf, "Nome": nome, 
+                    "Meses Encontrados": len(meses_presentes),
+                    "Obs": "Possível Admissão/Demissão ou Arquivo Faltante"
+                })
+
+            # 2. Auditoria de S-1210 (Tem cálculo mas não tem pagamento)
+            for comp in comps_encontradas:
                 if (cpf, comp) not in pagamentos_reais:
-                    pendencias_lista.append({
-                        "CPF": cpf, "Nome": mapa_nomes.get(cpf, f"CPF {cpf}"),
+                    pendencias_pagamento.append({
+                        "CPF": cpf, "Nome": nome,
                         "Competencia Faltante": comp, "Data Pagamento (DD/MM/AAAA)": "", "IRRF Manual (R$)": 0.0
                     })
         
-        df_manuais = pd.DataFrame()
+        # EXIBIÇÃO DOS RESULTADOS DA AUDITORIA
+        col_aud1, col_aud2 = st.columns(2)
         
-        # --- PAINEL 1: CORREÇÃO ---
-        tem_pendencias = len(pendencias_lista) > 0
-        if tem_pendencias:
-            with st.expander(f"⚠️ Correção de Pagamentos Faltantes ({len(pendencias_lista)} encontrados)", expanded=True):
-                st.error("Alguns pagamentos não foram encontrados. Preencha a data para incluí-los.")
-                df_pendencias = pd.DataFrame(pendencias_lista)
+        with col_aud1:
+            if alertas_ausencia:
+                st.warning(f"⚠️ **Alerta S-1200:** {len(alertas_ausencia)} funcionários têm menos de 12 meses calculados.")
+                with st.expander("Ver lista de possíveis faltas de arquivo S-1200"):
+                    st.dataframe(pd.DataFrame(alertas_ausencia), width='stretch')
+            else:
+                st.success("✅ Todos os funcionários têm 12 meses de S-1200.")
+
+        with col_aud2:
+            if pendencias_pagamento:
+                st.error(f"❌ **Erro S-1210:** {len(pendencias_pagamento)} competências calculadas sem pagamento.")
+            else:
+                st.success("✅ Todos os cálculos têm pagamento (S-1210) correspondente.")
+
+        # --- PAINEL DE CORREÇÃO (S-1210) ---
+        df_manuais = pd.DataFrame()
+        if pendencias_pagamento:
+            with st.expander("📝 Corrigir Pagamentos Faltantes (S-1210)", expanded=True):
+                st.info("Preencha a data de pagamento para os itens abaixo:")
+                df_pendencias = pd.DataFrame(pendencias_pagamento)
                 editor_pendencias = st.data_editor(
                     df_pendencias,
                     column_config={
@@ -252,19 +285,15 @@ if uploaded_zips:
                     hide_index=True, width='stretch', key="editor_manual"
                 )
                 df_manuais = editor_pendencias[editor_pendencias["Data Pagamento (DD/MM/AAAA)"] != ""]
-        else:
-            st.success("✅ Auditoria OK! Todos os pagamentos encontrados.")
 
-        # --- PAINEL 2: NOMES ---
-        with st.expander("👥 Conferência e Edição de Nomes", expanded=False):
+        # --- PAINEIS AUXILIARES ---
+        with st.expander("👥 Conferência de Nomes"):
             df_nomes = pd.DataFrame(cpfs, columns=['CPF'])
             df_nomes['Nome'] = df_nomes['CPF'].apply(lambda x: mapa_nomes.get(x, f"FUNCIONÁRIO CPF {x}"))
             df_nomes_editado = st.data_editor(df_nomes, hide_index=True, width='stretch')
             mapa_nomes_final = dict(zip(df_nomes_editado['CPF'], df_nomes_editado['Nome']))
 
-        # --- PAINEL 3: RUBRICAS ---
-        with st.expander("📊 Totais por Rubrica (Para auxiliar no De/Para)", expanded=False):
-            st.info("Consulte os totais para identificar códigos.")
+        with st.expander("📊 Totais por Rubrica (De/Para)"):
             resumo_rubricas = df_1200.groupby('Rubrica').agg(Total=('Valor', 'sum'), Qtd=('Rubrica', 'count')).reset_index().sort_values('Total', ascending=False)
             resumo_rubricas['Total'] = resumo_rubricas['Total'].apply(lambda x: f"R$ {x:,.2f}")
             st.dataframe(resumo_rubricas, width='stretch')
@@ -288,20 +317,20 @@ if uploaded_zips:
         nome_emp = col_emp1.text_input("Nome da Empresa", "SUA EMPRESA LTDA")
         cnpj_emp = col_emp2.text_input("CNPJ", "00.000.000/0001-00")
 
-        # --- CÁLCULO GERAL (ENGINE) ---
+        # --- ENGINE DE CÁLCULO ---
         def calcular_todos_funcionarios():
             resultados = []
             for cpf in cpfs:
-                # 1. Filtro de dados
                 itens = df_1200[df_1200['CPF'] == cpf].to_dict('records')
                 saude = df_1210[(df_1210['CPF'] == cpf) & (df_1210['Tipo'] == 'Saude')].to_dict('records')
                 
-                # 2. Competências pagas (XML + Manual)
+                # S-1210 XML
                 comps_pagas_xml = set()
                 if not df_1210.empty:
                     mask = (df_1210['CPF'] == cpf) & (df_1210['Tipo'] == 'Pagamento_Check')
                     comps_pagas_xml = set(df_1210[mask]['Competencia_Paga'].unique())
                 
+                # S-1210 Manual
                 comps_pagas_manual = set()
                 irrf_manual_total = 0.0
                 if not df_manuais.empty:
@@ -310,9 +339,12 @@ if uploaded_zips:
                     irrf_manual_total = manual_cpf['IRRF Manual (R$)'].sum()
                 
                 todas_comps_pagas = comps_pagas_xml.union(comps_pagas_manual)
+                
+                # Filtra itens válidos (Pagos no ano ou competência manual)
+                # OBS: Aqui assumimos que se a rubrica é anual (len 4), ela entra. 
+                # Se for mensal, tem que estar na lista de pagas.
                 itens_validos = [i for i in itens if i['Competencia'] in todas_comps_pagas or len(i['Competencia']) == 4]
                 
-                # 3. Somas
                 def somar(rubricas): return sum(i['Valor'] for i in itens_validos if i['Rubrica'] in rubricas)
                 
                 v_bruto = somar(r_bruto)
@@ -323,7 +355,6 @@ if uploaded_zips:
                 v_13_irrf = somar(r_irrf_13)
                 v_13_liq = v_13_bruto - v_13_inss
                 
-                # 4. Texto Saúde
                 txt_saude = ""
                 saude_dict = {}
                 for s in saude:
@@ -353,11 +384,11 @@ if uploaded_zips:
                 })
             return resultados
 
-        # --- BOTÕES DE EXPORTAÇÃO ---
+        # --- EXPORTAÇÃO ---
         st.divider()
-        col_btn_pdf, col_btn_excel = st.columns(2)
+        col_pdf, col_xls = st.columns(2)
         
-        with col_btn_pdf:
+        with col_pdf:
             if st.button("🚀 Gerar PDFs (ZIP)"):
                 if not r_bruto:
                     st.warning("Selecione rubricas de Salário!")
@@ -373,7 +404,7 @@ if uploaded_zips:
                     st.success("PDFs Gerados!")
                     st.download_button("📥 Baixar ZIP", zip_buffer.getvalue(), f"Informes_{ano_selecionado}.zip", "application/zip")
 
-        with col_btn_excel:
+        with col_xls:
             if st.button("📊 Baixar Relatório (Excel)"):
                 if not r_bruto:
                     st.warning("Selecione rubricas de Salário!")
