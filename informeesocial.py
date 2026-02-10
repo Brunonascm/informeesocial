@@ -12,12 +12,13 @@ st.set_page_config(page_title="Gerador Pro de Informes", page_icon="💼", layou
 st.title("💼 Gerador de Informes de Rendimentos (eSocial)")
 st.markdown("""
 **Instruções:**
-1. Arraste os arquivos ZIP (Inclua S-2200 e S-2299 para validar Admissão/Demissão).
-2. Defina o **Ano-Calendário**.
-3. Verifique a **Auditoria Inteligente**.
+1. Arraste os arquivos ZIP contendo os XMLs do eSocial (S-1200, S-1210, S-2200, S-2299, etc).
+2. Defina o **Ano-Calendário** abaixo.
+3. O sistema fará a auditoria automática. Corrija pendências se houver.
+4. Mapeie as rubricas e gere os relatórios.
 """)
 
-# --- CLASSE PDF (LAYOUT RECEITA FEDERAL) ---
+# --- CLASSE PDF (LAYOUT RECEITA FEDERAL - BOX) ---
 class PDFLayoutReceita(FPDF):
     def __init__(self, ano_calendario):
         super().__init__()
@@ -155,26 +156,40 @@ def processar_arquivos(uploaded_files):
                     root = strip_namespace(content)
                     if root is None: continue
                     
-                    # ADMISSÃO (S-2200) - CAPTURA DATA
-                    if root.find('.//trabalhador') and not root.find('.//desligamento'):
+                    # 1. ADMISSÃO/INÍCIO (S-2200 ou S-2300)
+                    if root.find('.//trabalhador') and not (root.find('.//desligamento') or root.find('.//termino')):
                         try:
                             cpf = root.find('.//cpfTrab').text
                             mapa_nomes[cpf] = root.find('.//nmTrab').text
-                            dt_adm = root.find('.//dtAdm').text 
-                            mapa_admissao[cpf] = dt_adm
+                            
+                            dt_inicio = None
+                            if root.find('.//dtAdm'): 
+                                dt_inicio = root.find('.//dtAdm').text
+                            elif root.find('.//dtInicio'):
+                                dt_inicio = root.find('.//dtInicio').text
+                                
+                            if dt_inicio:
+                                mapa_admissao[cpf] = dt_inicio
                         except: pass
 
-                    # DESLIGAMENTO (S-2299) - CAPTURA DATA
-                    elif root.find('.//desligamento'):
+                    # 2. DESLIGAMENTO/TÉRMINO (S-2299 ou S-2399)
+                    elif root.find('.//desligamento') or root.find('.//termino'):
                         try:
                             cpf = root.find('.//cpfTrab').text
                             if root.find('.//nmTrab'):
                                 mapa_nomes[cpf] = root.find('.//nmTrab').text
-                            dt_deslig = root.find('.//dtDeslig').text
-                            mapa_demissao[cpf] = dt_deslig
+                            
+                            dt_fim = None
+                            if root.find('.//dtDeslig'):
+                                dt_fim = root.find('.//dtDeslig').text
+                            elif root.find('.//dtTerm'):
+                                dt_fim = root.find('.//dtTerm').text
+                                
+                            if dt_fim:
+                                mapa_demissao[cpf] = dt_fim
                         except: pass
                     
-                    # S-1200
+                    # 3. S-1200
                     elif root.find('.//evtRemun'): 
                         try:
                             cpf = root.find('.//cpfTrab').text
@@ -191,7 +206,7 @@ def processar_arquivos(uploaded_files):
                                     })
                         except: pass
                     
-                    # S-1210
+                    # 4. S-1210
                     elif root.find('.//evtPgtos'): 
                         try:
                             ide_benef = root.find('.//ideBenef')
@@ -256,34 +271,48 @@ if uploaded_zips:
                 })
                 continue 
 
-            # 2. Checa meses faltantes no S-1200 (INTELIGENTE)
+            # 2. Meses Faltantes (Com Raio-X das Datas)
             comps_encontradas = set(df_1200[df_1200['CPF'] == cpf]['Competencia'].unique())
             
             # Lógica de Datas
             mes_inicio, mes_fim = 1, 12
-            obs_periodo = "Ano Completo"
+            dt_adm_str = "Não encontrada (S-2200 ausente)"
+            dt_dem_str = "Ativo"
             
+            # Verifica início
             if cpf in mapa_admissao:
                 dt_adm = datetime.datetime.strptime(mapa_admissao[cpf], "%Y-%m-%d")
+                dt_adm_str = dt_adm.strftime('%d/%m/%Y')
                 if dt_adm.year == ano_selecionado:
                     mes_inicio = dt_adm.month
-                    obs_periodo = f"Admissão em {dt_adm.strftime('%d/%m')}"
+                elif dt_adm.year > ano_selecionado:
+                    mes_inicio = 13 # Admitido no futuro
             
+            # Verifica fim
             if cpf in mapa_demissao:
                 dt_dem = datetime.datetime.strptime(mapa_demissao[cpf], "%Y-%m-%d")
+                dt_dem_str = dt_dem.strftime('%d/%m/%Y')
                 if dt_dem.year == ano_selecionado:
                     mes_fim = dt_dem.month
-                    obs_periodo = f"Desligamento em {dt_dem.strftime('%d/%m')}"
+                elif dt_dem.year < ano_selecionado:
+                    mes_fim = 0 # Demitido ano passado
 
-            # Verifica buracos no período ativo
-            meses_esperados = [f"{ano_selecionado}-{str(m).zfill(2)}" for m in range(mes_inicio, mes_fim + 1)]
+            # Gera régua esperada
+            if mes_inicio <= mes_fim:
+                meses_esperados = [f"{ano_selecionado}-{str(m).zfill(2)}" for m in range(mes_inicio, mes_fim + 1)]
+            else:
+                meses_esperados = []
+
             faltantes = [m for m in meses_esperados if m not in comps_encontradas]
             
             if faltantes:
                 alertas_meses_faltantes.append({
-                    "CPF": cpf, "Nome": nome,
+                    "CPF": cpf, 
+                    "Nome": nome,
                     "Meses Faltantes": ", ".join(faltantes),
-                    "Motivo Calculado": obs_periodo # Transparência para o usuário
+                    "Data Admissão (Lida)": dt_adm_str,
+                    "Data Demissão (Lida)": dt_dem_str,
+                    "Regra Aplicada": f"Esperado de {mes_inicio:02d}/{ano_selecionado} a {mes_fim:02d}/{ano_selecionado}"
                 })
 
             # 3. Checa S-1210 faltante
@@ -307,9 +336,17 @@ if uploaded_zips:
 
         with c2:
             if alertas_meses_faltantes:
-                st.warning(f"⚠️ **Aviso S-1200:** {len(alertas_meses_faltantes)} CPFs com meses faltantes.")
-                with st.expander("Verificar se é erro ou admissão não lida"):
-                    st.dataframe(pd.DataFrame(alertas_meses_faltantes), width='stretch')
+                st.warning(f"⚠️ **Aviso de Continuidade:** {len(alertas_meses_faltantes)} CPFs.")
+                with st.expander("🔍 RAIO-X: Ver motivos (Admissão/Arquivo Faltante)", expanded=True):
+                    df_debug = pd.DataFrame(alertas_meses_faltantes)
+                    st.dataframe(
+                        df_debug, 
+                        column_config={
+                            "Meses Faltantes": st.column_config.TextColumn(width="medium"),
+                            "Regra Aplicada": st.column_config.TextColumn(width="medium"),
+                        },
+                        width='stretch'
+                    )
             else:
                 st.success("✅ Sequência de meses correta.")
 
@@ -372,7 +409,7 @@ if uploaded_zips:
         nome_emp = col_emp1.text_input("Nome da Empresa", "SUA EMPRESA LTDA")
         cnpj_emp = col_emp2.text_input("CNPJ", "00.000.000/0001-00")
 
-        # --- CALCULO ---
+        # --- ENGINE DE CÁLCULO ---
         def calcular_todos_funcionarios():
             resultados = []
             for cpf in todos_cpfs:
@@ -395,7 +432,6 @@ if uploaded_zips:
                 
                 todas_comps_pagas = comps_pagas_xml.union(comps_pagas_manual)
                 
-                # Assume que rubricas anuais (13o) entram se houver pagamento anual ou se for Dezembro
                 itens_validos = [i for i in itens if i['Competencia'] in todas_comps_pagas or len(i['Competencia']) == 4]
                 
                 def somar(rubricas): return sum(i['Valor'] for i in itens_validos if i['Rubrica'] in rubricas)
